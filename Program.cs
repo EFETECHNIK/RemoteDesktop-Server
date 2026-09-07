@@ -1,14 +1,9 @@
 using Microsoft.AspNetCore.SignalR;
+using System.Collections.Concurrent;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Ekran akışı ve komutlar için 10MB mesaj sınırı
-builder.Services.AddSignalR(options =>
-{
-    options.EnableDetailedErrors = true;
-    options.MaximumReceiveMessageSize = 10 * 1024 * 1024;
-});
-
+// CORS İzinleri (Bulut üzerinden masaüstü erişimi için)
 builder.Services.AddCors(options =>
 {
     options.AddDefaultPolicy(policy =>
@@ -20,73 +15,105 @@ builder.Services.AddCors(options =>
     });
 });
 
+// SignalR Servisi (Ekran aktarımı için paket boyut limiti 50MB'a çıkarıldı)
+builder.Services.AddSignalR(hubOptions =>
+{
+    hubOptions.MaximumReceiveMessageSize = 50 * 1024 * 1024;
+    hubOptions.EnableDetailedErrors = true;
+    hubOptions.KeepAliveInterval = TimeSpan.FromSeconds(10);
+    hubOptions.ClientTimeoutInterval = TimeSpan.FromSeconds(30);
+});
+
 var app = builder.Build();
 
 app.UseCors();
-
-// Test ve sağlık kontrolü
-app.MapGet("/", () => "EFETECHNIK Sunucusu Aktif!");
-
-// İstemcilerin bağlanacağı dağıtım ucu
 app.MapHub<RelayHub>("/relayHub");
+app.MapGet("/", () => "EFETECHNIK Remote Desktop Relay Server Aktif!");
 
 app.Run();
 
+// Tüm İletişimi Yöneten Ana Hub
 public class RelayHub : Hub
 {
-    private static readonly Dictionary<string, string> OnlineDevices = new();
+    // Cihaz Kimliği (EFETECHNIK-XXXX) ile SignalR ConnectionId Eşleşmesi
+    private static readonly ConcurrentDictionary<string, string> DeviceConnections = new();
+    private static readonly ConcurrentDictionary<string, string> ConnectionDevices = new();
 
+    // 1. Cihazı Sunucuya Tanıtma
     public Task RegisterDevice(string deviceId)
     {
-        lock (OnlineDevices)
-        {
-            OnlineDevices[deviceId] = Context.ConnectionId;
-        }
-        return Clients.Caller.SendAsync("RegistrationSuccess", deviceId);
+        DeviceConnections[deviceId] = Context.ConnectionId;
+        ConnectionDevices[Context.ConnectionId] = deviceId;
+        return Task.CompletedTask;
     }
 
-    public async Task RequestConnection(string targetDeviceId, string requesterName)
+    // 2. Bağlantı İsteği Gönderme
+    public async Task RequestConnection(string targetDeviceId)
     {
-        string? targetConnectionId;
-        lock (OnlineDevices)
+        if (DeviceConnections.TryGetValue(targetDeviceId, out var targetConnectionId))
         {
-            OnlineDevices.TryGetValue(targetDeviceId, out targetConnectionId);
-        }
-
-        if (!string.IsNullOrEmpty(targetConnectionId))
-        {
-            await Clients.Client(targetConnectionId).SendAsync("IncomingConnectionRequest", Context.ConnectionId, requesterName);
+            var senderId = ConnectionDevices.TryGetValue(Context.ConnectionId, out var devId) ? devId : "Bilinmeyen Cihaz";
+            await Clients.Client(targetConnectionId).SendAsync("ReceiveConnectionRequest", senderId);
         }
         else
         {
-            await Clients.Caller.SendAsync("ConnectionFailed", "Cihaz çevrim dışı veya bulunamadı.");
+            await Clients.Caller.SendAsync("ConnectionRejected", "Hedef cihaz çevrimdışı veya bulunamadı.");
         }
     }
 
-    public Task RespondConnection(string requesterConnectionId, bool approved)
+    // 3. İsteği Kabul Etme
+    public async Task AcceptConnection(string requesterDeviceId)
     {
-        return Clients.Client(requesterConnectionId).SendAsync("ConnectionResponse", approved, Context.ConnectionId);
+        if (DeviceConnections.TryGetValue(requesterDeviceId, out var requesterConnectionId))
+        {
+            var myDeviceId = ConnectionDevices.TryGetValue(Context.ConnectionId, out var devId) ? devId : "Host";
+            await Clients.Client(requesterConnectionId).SendAsync("ConnectionAccepted", myDeviceId);
+        }
     }
 
-    public Task SendScreenFrame(string targetConnectionId, byte[] frameData)
+    // 4. İsteği Reddetme
+    public async Task RejectConnection(string requesterDeviceId)
     {
-        return Clients.Client(targetConnectionId).SendAsync("ReceiveScreenFrame", frameData);
+        if (DeviceConnections.TryGetValue(requesterDeviceId, out var requesterConnectionId))
+        {
+            var myDeviceId = ConnectionDevices.TryGetValue(Context.ConnectionId, out var devId) ? devId : "Host";
+            await Clients.Client(requesterConnectionId).SendAsync("ConnectionRejected", myDeviceId);
+        }
     }
 
-    public Task SendInputEvent(string targetConnectionId, string command)
+    // 5. Ekran Karesi Aktarımı
+    public async Task SendScreenFrame(string targetDeviceId, byte[] frameData)
     {
-        return Clients.Client(targetConnectionId).SendAsync("ReceiveInputEvent", command);
+        if (DeviceConnections.TryGetValue(targetDeviceId, out var targetConnectionId))
+        {
+            await Clients.Client(targetConnectionId).SendAsync("ReceiveScreenFrame", frameData);
+        }
     }
 
+    // 6. Fare / Klavye Giriş Olayları
+    public async Task SendInputEvent(string targetDeviceId, string actionType, double normX, double normY, string btn)
+    {
+        if (DeviceConnections.TryGetValue(targetDeviceId, out var targetConnectionId))
+        {
+            await Clients.Client(targetConnectionId).SendAsync("ReceiveInputEvent", actionType, normX, normY, btn);
+        }
+    }
+
+    // 7. Oturumu İki Taraflı Kapatma
+    public async Task DisconnectSession(string targetDeviceId)
+    {
+        if (DeviceConnections.TryGetValue(targetDeviceId, out var targetConnectionId))
+        {
+            await Clients.Client(targetConnectionId).SendAsync("SessionTerminated");
+        }
+    }
+
+    // Bağlantı Koptuğunda Bellekten Temizleme
     public override Task OnDisconnectedAsync(Exception? exception)
     {
-        lock (OnlineDevices)
+        if (ConnectionDevices.TryRemove(Context.ConnectionId, out var deviceId))
         {
-            var item = OnlineDevices.FirstOrDefault(kvp => kvp.Value == Context.ConnectionId);
-            if (!string.IsNullOrEmpty(item.Key))
-            {
-                OnlineDevices.Remove(item.Key);
-            }
+            DeviceConnections.TryRemove(deviceId, out _);
         }
         return base.OnDisconnectedAsync(exception);
     }
