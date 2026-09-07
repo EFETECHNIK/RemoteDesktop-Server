@@ -3,7 +3,6 @@ using System.Collections.Concurrent;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// CORS İzinleri (Bulut üzerinden masaüstü erişimi için)
 builder.Services.AddCors(options =>
 {
     options.AddDefaultPolicy(policy =>
@@ -15,13 +14,10 @@ builder.Services.AddCors(options =>
     });
 });
 
-// SignalR Servisi (Ekran aktarımı için paket boyut limiti 50MB'a çıkarıldı)
 builder.Services.AddSignalR(hubOptions =>
 {
-    hubOptions.MaximumReceiveMessageSize = 50 * 1024 * 1024;
+    hubOptions.MaximumReceiveMessageSize = 100 * 1024 * 1024; // Dosya aktarımı için 100MB yapıldı
     hubOptions.EnableDetailedErrors = true;
-    hubOptions.KeepAliveInterval = TimeSpan.FromSeconds(10);
-    hubOptions.ClientTimeoutInterval = TimeSpan.FromSeconds(30);
 });
 
 var app = builder.Build();
@@ -32,14 +28,11 @@ app.MapGet("/", () => "EFETECHNIK Remote Desktop Relay Server Aktif!");
 
 app.Run();
 
-// Tüm İletişimi Yöneten Ana Hub
 public class RelayHub : Hub
 {
-    // Cihaz Kimliği (EFETECHNIK-XXXX) ile SignalR ConnectionId Eşleşmesi
     private static readonly ConcurrentDictionary<string, string> DeviceConnections = new();
     private static readonly ConcurrentDictionary<string, string> ConnectionDevices = new();
 
-    // 1. Cihazı Sunucuya Tanıtma
     public Task RegisterDevice(string deviceId)
     {
         DeviceConnections[deviceId] = Context.ConnectionId;
@@ -47,21 +40,19 @@ public class RelayHub : Hub
         return Task.CompletedTask;
     }
 
-    // 2. Bağlantı İsteği Gönderme
     public async Task RequestConnection(string targetDeviceId)
     {
         if (DeviceConnections.TryGetValue(targetDeviceId, out var targetConnectionId))
         {
-            var senderId = ConnectionDevices.TryGetValue(Context.ConnectionId, out var devId) ? devId : "Bilinmeyen Cihaz";
+            var senderId = ConnectionDevices.TryGetValue(Context.ConnectionId, out var devId) ? devId : "Bilinmeyen";
             await Clients.Client(targetConnectionId).SendAsync("ReceiveConnectionRequest", senderId);
         }
         else
         {
-            await Clients.Caller.SendAsync("ConnectionRejected", "Hedef cihaz çevrimdışı veya bulunamadı.");
+            await Clients.Caller.SendAsync("ConnectionRejected", "Hedef cihaz bulunamadı.");
         }
     }
 
-    // 3. İsteği Kabul Etme
     public async Task AcceptConnection(string requesterDeviceId)
     {
         if (DeviceConnections.TryGetValue(requesterDeviceId, out var requesterConnectionId))
@@ -71,7 +62,6 @@ public class RelayHub : Hub
         }
     }
 
-    // 4. İsteği Reddetme
     public async Task RejectConnection(string requesterDeviceId)
     {
         if (DeviceConnections.TryGetValue(requesterDeviceId, out var requesterConnectionId))
@@ -81,7 +71,6 @@ public class RelayHub : Hub
         }
     }
 
-    // 5. Ekran Karesi Aktarımı
     public async Task SendScreenFrame(string targetDeviceId, byte[] frameData)
     {
         if (DeviceConnections.TryGetValue(targetDeviceId, out var targetConnectionId))
@@ -90,7 +79,6 @@ public class RelayHub : Hub
         }
     }
 
-    // 6. Fare / Klavye Giriş Olayları
     public async Task SendInputEvent(string targetDeviceId, string actionType, double normX, double normY, string btn)
     {
         if (DeviceConnections.TryGetValue(targetDeviceId, out var targetConnectionId))
@@ -99,7 +87,22 @@ public class RelayHub : Hub
         }
     }
 
-    // 7. Oturumu İki Taraflı Kapatma
+    public async Task SendKeyEvent(string targetDeviceId, string eventType, int vkCode)
+    {
+        if (DeviceConnections.TryGetValue(targetDeviceId, out var targetConnectionId))
+        {
+            await Clients.Client(targetConnectionId).SendAsync("ReceiveKeyEvent", eventType, vkCode);
+        }
+    }
+
+    public async Task SendFilePayload(string targetDeviceId, string fileName, byte[] fileBytes)
+    {
+        if (DeviceConnections.TryGetValue(targetDeviceId, out var targetConnectionId))
+        {
+            await Clients.Client(targetConnectionId).SendAsync("ReceiveFilePayload", fileName, fileBytes);
+        }
+    }
+
     public async Task DisconnectSession(string targetDeviceId)
     {
         if (DeviceConnections.TryGetValue(targetDeviceId, out var targetConnectionId))
@@ -108,7 +111,6 @@ public class RelayHub : Hub
         }
     }
 
-    // Bağlantı Koptuğunda Bellekten Temizleme
     public override Task OnDisconnectedAsync(Exception? exception)
     {
         if (ConnectionDevices.TryRemove(Context.ConnectionId, out var deviceId))
